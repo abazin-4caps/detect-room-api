@@ -65,7 +65,7 @@ def detect_wall_categories(paths, page_width, page_height):
             x0, y0 = item[1].x, item[1].y
             x1, y1 = item[2].x, item[2].y
             length = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
-            if 10 <= length <= max_allowed:
+            if 10 <= length <= 500:
                 lengths.append((length, x0, y0, x1, y1))
 
         if not lengths:
