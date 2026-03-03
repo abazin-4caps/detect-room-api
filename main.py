@@ -6,6 +6,8 @@ import numpy as np
 import cv2
 import base64
 import os
+import requests
+import fitz  # PyMuPDF
 
 app = FastAPI()
 
@@ -17,9 +19,10 @@ app.add_middleware(
 )
 
 class DetectRoomRequest(BaseModel):
-    image_base64: str
-    click_x: int
-    click_y: int
+    pdf_url: str
+    click_x: float  # coordonnées en points PDF
+    click_y: float
+    page_number: int = 1
 
 @app.get("/")
 def health():
@@ -35,40 +38,60 @@ def get_debug_image(filename: str):
 @app.post("/detect-room")
 def detect_room(req: DetectRoomRequest):
     try:
-        img_bytes = base64.b64decode(req.image_base64)
-        np_arr = np.frombuffer(img_bytes, np.uint8)
-        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        print(f"PDF URL: {req.pdf_url[:80]}...")
+        print(f"CLICK: x={req.click_x}, y={req.click_y}, page={req.page_number}")
 
-        if img is None:
-            raise HTTPException(status_code=400, detail="Image invalide")
+        # Télécharger le PDF
+        response = requests.get(req.pdf_url, timeout=30)
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Impossible de télécharger le PDF")
+
+        # Ouvrir avec PyMuPDF
+        pdf = fitz.open(stream=response.content, filetype="pdf")
+        page = pdf[req.page_number - 1]
+
+        # Rendu haute résolution (3x pour avoir des murs épais)
+        zoom = 3
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+
+        # Convertir en image OpenCV
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
         h, w = img.shape[:2]
-        print(f"IMAGE: {w}x{h}, CLICK: {req.click_x},{req.click_y}")
+
+        # Convertir les coordonnées PDF en pixels image
+        click_px = int(req.click_x * zoom)
+        click_py = int(req.click_y * zoom)
+
+        print(f"IMAGE: {w}x{h}, CLICK PX: {click_px},{click_py}")
+
+        if not (0 <= click_px < w and 0 <= click_py < h):
+            raise HTTPException(status_code=400, detail="Coordonnées hors page")
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Seuillage : garder seulement les traits sombres
-        _, binary = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
+        # Seuillage — murs sombres
+        _, binary = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
 
-        # Supprimer les traits fins (meubles, cotations, texte)
-        # Ne garde que les murs épais
-        kernel_thin = np.ones((2, 2), np.uint8)
-        walls_only = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_thin, iterations=1)
+        # Supprimer traits fins (meubles, cotations)
+        kernel_open = np.ones((2, 2), np.uint8)
+        walls_only = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_open, iterations=1)
 
         # Fermer les portes
-        kernel_close = np.ones((20, 20), np.uint8)
+        kernel_close = np.ones((15, 15), np.uint8)
         closed = cv2.morphologyEx(walls_only, cv2.MORPH_CLOSE, kernel_close)
 
         # Sauvegarder debug
         cv2.imwrite("/tmp/debug_crop.png", img)
-        cv2.imwrite("/tmp/debug_binary.png", binary)
         cv2.imwrite("/tmp/debug_walls.png", walls_only)
         cv2.imwrite("/tmp/debug_closed.png", closed)
 
-        # Flood fill pour isoler la pièce
+        # Flood fill
         flood = cv2.bitwise_not(closed)
         mask = np.zeros((h + 2, w + 2), np.uint8)
-        cv2.floodFill(flood, mask, (req.click_x, req.click_y), 128)
+        cv2.floodFill(flood, mask, (click_px, click_py), 128)
         room_mask = np.uint8(flood == 128) * 255
 
         cv2.imwrite("/tmp/debug_flood.png", room_mask)
@@ -76,11 +99,10 @@ def detect_room(req: DetectRoomRequest):
         if cv2.countNonZero(room_mask) < 500:
             raise HTTPException(status_code=404, detail="Aucune pièce détectée")
 
-        # Éroder légèrement pour rentrer dans les murs
-        kernel_erode = np.ones((10, 10), np.uint8)
+        # Simplification du contour
+        kernel_erode = np.ones((8, 8), np.uint8)
         room_eroded = cv2.erode(room_mask, kernel_erode, iterations=1)
 
-        # Simplification agressive pour ne garder que les coins
         contours, _ = cv2.findContours(room_eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not contours:
@@ -88,11 +110,13 @@ def detect_room(req: DetectRoomRequest):
 
         contour = max(contours, key=cv2.contourArea)
 
-        epsilon = 0.05 * cv2.arcLength(contour, True)
+        epsilon = 0.02 * cv2.arcLength(contour, True)
         polygon = cv2.approxPolyDP(contour, epsilon, True)
-        points = [[int(p[0][0]), int(p[0][1])] for p in polygon]
 
-        print(f"POINTS POLYGONE: {len(points)} -> {points}")
+        # Reconvertir en coordonnées PDF
+        points = [[round(p[0][0] / zoom, 2), round(p[0][1] / zoom, 2)] for p in polygon]
+
+        print(f"POINTS: {len(points)}")
 
         return {"polygon": points, "point_count": len(points)}
 
