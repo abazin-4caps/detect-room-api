@@ -88,7 +88,7 @@ def detect_room(req: DetectRoomRequest):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
         # Seuillage
-        _, binary = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+        _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
 
         # Supprimer traits fins
         kernel_open = np.ones((2, 2), np.uint8)
