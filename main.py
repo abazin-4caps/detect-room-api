@@ -55,8 +55,12 @@ def detect_room(req: DetectRoomRequest):
         _, binary = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
 
         # Fermer les petits gaps
-        kernel_close = np.ones((5, 5), np.uint8)
+        kernel_close = np.ones((25, 25), np.uint8)
         closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_close)
+
+        # Fermer aussi les portes en dilatant davantage
+        kernel_dilate = np.ones((5, 5), np.uint8)
+        closed = cv2.dilate(closed, kernel_dilate, iterations=3)
 
         # Sauvegarder debug
         cv2.imwrite("/tmp/debug_crop.png", img)
