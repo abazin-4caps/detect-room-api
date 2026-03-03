@@ -47,14 +47,23 @@ def detect_room(req: DetectRoomRequest):
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Détecter les murs (pixels sombres)
+        # Seuillage : garder seulement les traits sombres
         _, binary = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
 
+        # Supprimer les traits fins (meubles, cotations, texte)
+        # Ne garde que les murs épais
+        kernel_thin = np.ones((3, 3), np.uint8)
+        walls_only = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_thin, iterations=2)
+
         # Fermer les portes
-        kernel_close = np.ones((25, 25), np.uint8)
-        closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_close)
-        kernel_dilate = np.ones((5, 5), np.uint8)
-        closed = cv2.dilate(closed, kernel_dilate, iterations=3)
+        kernel_close = np.ones((20, 20), np.uint8)
+        closed = cv2.morphologyEx(walls_only, cv2.MORPH_CLOSE, kernel_close)
+
+        # Sauvegarder debug
+        cv2.imwrite("/tmp/debug_crop.png", img)
+        cv2.imwrite("/tmp/debug_binary.png", binary)
+        cv2.imwrite("/tmp/debug_walls.png", walls_only)
+        cv2.imwrite("/tmp/debug_closed.png", closed)
 
         # Flood fill pour isoler la pièce
         flood = cv2.bitwise_not(closed)
@@ -62,60 +71,28 @@ def detect_room(req: DetectRoomRequest):
         cv2.floodFill(flood, mask, (req.click_x, req.click_y), 128)
         room_mask = np.uint8(flood == 128) * 255
 
-        cv2.imwrite("/tmp/debug_crop.png", img)
-        cv2.imwrite("/tmp/debug_binary.png", binary)
         cv2.imwrite("/tmp/debug_flood.png", room_mask)
 
         if cv2.countNonZero(room_mask) < 500:
             raise HTTPException(status_code=404, detail="Aucune pièce détectée")
 
-        # Trouver la bounding box de la zone flood
-        coords = cv2.findNonZero(room_mask)
-        x, y, bw, bh = cv2.boundingRect(coords)
+        # Éroder légèrement pour rentrer dans les murs
+        kernel_erode = np.ones((10, 10), np.uint8)
+        room_eroded = cv2.erode(room_mask, kernel_erode, iterations=1)
 
-        # Chercher les vrais bords des murs dans chaque direction
-        # en partant du centre et en cherchant les murs les plus proches
-        cx, cy = req.click_x, req.click_y
+        # Simplification agressive pour ne garder que les coins
+        contours, _ = cv2.findContours(room_eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        def find_wall(mask, start_x, start_y, dx, dy):
-            """Cherche le premier pixel NON dans la pièce en partant du centre"""
-            px, py = start_x, start_y
-            while 0 <= px < w and 0 <= py < h:
-                if mask[py, px] == 0:
-                    return px - dx, py - dy
-                px += dx
-                py += dy
-            return px - dx, py - dy
+        if not contours:
+            raise HTTPException(status_code=404, detail="Aucun contour trouvé")
 
-        # Trouver les 4 murs (haut, bas, gauche, droite)
-        _, top_y = find_wall(room_mask, cx, cy, 0, -1)
-        _, bot_y = find_wall(room_mask, cx, cy, 0, 1)
-        left_x, _ = find_wall(room_mask, cx, cy, -1, 0)
-        right_x, _ = find_wall(room_mask, cx, cy, 1, 0)
+        contour = max(contours, key=cv2.contourArea)
 
-        print(f"MURS: top={top_y}, bot={bot_y}, left={left_x}, right={right_x}")
+        epsilon = 0.05 * cv2.arcLength(contour, True)
+        polygon = cv2.approxPolyDP(contour, epsilon, True)
+        points = [[int(p[0][0]), int(p[0][1])] for p in polygon]
 
-        # Affiner en cherchant les coins réels depuis les bords
-        # Haut-gauche
-        tl_x, _ = find_wall(room_mask, left_x, top_y + 5, -1, 0)
-        tr_x, _ = find_wall(room_mask, right_x, top_y + 5, 1, 0)
-        bl_x, _ = find_wall(room_mask, left_x, bot_y - 5, -1, 0)
-        br_x, _ = find_wall(room_mask, right_x, bot_y - 5, 1, 0)
-
-        _, tl_y = find_wall(room_mask, tl_x + 5, top_y, 0, -1)
-        _, tr_y = find_wall(room_mask, tr_x - 5, top_y, 0, -1)
-        _, bl_y = find_wall(room_mask, bl_x + 5, bot_y, 0, 1)
-        _, br_y = find_wall(room_mask, br_x - 5, bot_y, 0, 1)
-
-        # Construire le polygone orthogonal
-        points = [
-            [tl_x, tl_y],
-            [tr_x, tr_y],
-            [br_x, br_y],
-            [bl_x, bl_y],
-        ]
-
-        print(f"POINTS: {points}")
+        print(f"POINTS POLYGONE: {len(points)} -> {points}")
 
         return {"polygon": points, "point_count": len(points)}
 
