@@ -52,7 +52,7 @@ def detect_room(req: DetectRoomRequest):
 
         # Seuillage : murs sombres → blanc, espace vide → noir
         # C'est l'inverse de avant !
-        _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+        _, binary = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
 
         # Fermer les petits gaps
         kernel_close = np.ones((5, 5), np.uint8)
