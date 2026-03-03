@@ -48,37 +48,33 @@ def detect_room(req: DetectRoomRequest):
 
         h, w = img.shape[:2]
 
-        if not (0 <= req.click_x < w and 0 <= req.click_y < h):
-            raise HTTPException(status_code=400, detail="Coordonnées hors image")
-
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        binary = cv2.adaptiveThreshold(
-            gray, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            blockSize=15, C=4
-        )
+        # Seuillage : murs sombres → blanc, espace vide → noir
+        # C'est l'inverse de avant !
+        _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
 
-        kernel_close = np.ones((15, 15), np.uint8)
+        # Fermer les petits gaps
+        kernel_close = np.ones((5, 5), np.uint8)
         closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_close)
 
-        kernel_dilate = np.ones((3, 3), np.uint8)
-        closed = cv2.dilate(closed, kernel_dilate, iterations=2)
-
-        # Sauvegarder les images de debug
+        # Sauvegarder debug
         cv2.imwrite("/tmp/debug_crop.png", img)
         cv2.imwrite("/tmp/debug_binary.png", binary)
         cv2.imwrite("/tmp/debug_closed.png", closed)
 
-        flood = closed.copy()
+        # Flood fill sur l'image INVERSÉE
+        # On travaille sur une copie où murs=blanc, vide=noir
+        flood_input = cv2.bitwise_not(closed)  # murs=noir, vide=blanc
         mask = np.zeros((h + 2, w + 2), np.uint8)
-        cv2.floodFill(flood, mask, (req.click_x, req.click_y), 128)
+        cv2.floodFill(flood_input, mask, (req.click_x, req.click_y), 128)
 
-        room_mask = np.uint8(flood == 128) * 255
+        room_mask = np.uint8(flood_input == 128) * 255
         cv2.imwrite("/tmp/debug_flood.png", room_mask)
 
         contours, _ = cv2.findContours(room_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        print(f"CONTOURS TROUVÉS: {len(contours)}")
 
         if not contours:
             raise HTTPException(status_code=404, detail="Aucune pièce détectée")
@@ -93,7 +89,6 @@ def detect_room(req: DetectRoomRequest):
 
         contour = min(contours, key=dist_to_click)
 
-        print(f"CONTOURS TROUVÉS: {len(contours)}")
         print(f"SURFACE CONTOUR: {cv2.contourArea(contour)}")
 
         if cv2.contourArea(contour) < 500:
