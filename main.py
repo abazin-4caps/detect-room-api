@@ -89,7 +89,7 @@ def debug_vectors(req: DetectRoomRequest):
         min_width = 0.43
         min_length = 30
 
-        zoom = 2
+        zoom = 1
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
         img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
