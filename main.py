@@ -79,6 +79,74 @@ def explore_vectors(req: DetectRoomRequest):
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/debug-vectors")
+def debug_vectors(req: DetectRoomRequest):
+    try:
+        response = requests.get(req.pdf_url, timeout=30)
+        pdf = fitz.open(stream=response.content, filetype="pdf")
+        page = pdf[req.page_number - 1]
+
+        min_width = 0.43
+        min_length = 30
+
+        zoom = 2
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+        img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+
+        wall_img = np.ones((pix.height, pix.width, 3), dtype=np.uint8) * 255
+
+        paths = page.get_drawings()
+        n_drawn = 0
+
+        for p in paths:
+            w = p.get('width') or 0
+            col = p.get('color')
+            if w < min_width:
+                continue
+            if col is None:
+                continue
+
+            for item in p.get('items', []):
+                if item[0] != 'l':
+                    continue
+                x0, y0 = item[1].x, item[1].y
+                x1, y1 = item[2].x, item[2].y
+                length = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+                if length < min_length:
+                    continue
+
+                pt1 = (int(x0 * zoom), int(y0 * zoom))
+                pt2 = (int(x1 * zoom), int(y1 * zoom))
+
+                if w >= 0.85:
+                    color = (0, 0, 200)
+                    thickness = 6
+                elif w >= 0.43:
+                    color = (0, 150, 255)
+                    thickness = 4
+                else:
+                    color = (0, 200, 0)
+                    thickness = 2
+
+                cv2.line(wall_img, pt1, pt2, color, thickness)
+                n_drawn += 1
+
+        cv2.imwrite("/tmp/debug_vectors.png", wall_img)
+
+        overlay = img_bgr.copy()
+        mask = np.any(wall_img < 200, axis=2)
+        overlay[mask] = wall_img[mask]
+        cv2.imwrite("/tmp/debug_vectors_overlay.png", overlay)
+
+        return {"segments_dessines": n_drawn, "zoom": zoom}
+
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/detect-room")
 def detect_room(req: DetectRoomRequest):
     try:
