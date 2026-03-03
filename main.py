@@ -30,6 +30,66 @@ def get_debug_image(filename: str):
         return FileResponse(path)
     raise HTTPException(status_code=404, detail="Fichier non trouvé")
 
+def detect_wall_categories(paths, page_width, page_height):
+    """
+    Détecte automatiquement quelles catégories de segments sont des murs.
+    Critères :
+    - Couleur noire ou quasi-noire (r+g+b < 0.3)
+    - Longueur max entre 10 et page_size*0.8 (exclut les lignes de grille)
+    - Au moins 10 segments longs (> 20pts)
+    - Epaisseur > 0 (trait, pas fill)
+    """
+    max_page = max(page_width, page_height)
+    max_allowed = max_page * 0.8  # exclut les lignes qui traversent toute la page
+
+    categories = {}
+
+    for p in paths:
+        w = p.get('width') or 0
+        if w <= 0:
+            continue
+        col = p.get('color')
+        if col is None:
+            continue
+
+        # Filtre couleur : noir ou quasi-noir
+        r, g, b = col[0], col[1], col[2]
+        if r + g + b > 0.5:  # trop clair = pas un mur
+            continue
+
+        # Collecter les segments
+        lengths = []
+        for item in p.get('items', []):
+            if item[0] != 'l':
+                continue
+            x0, y0 = item[1].x, item[1].y
+            x1, y1 = item[2].x, item[2].y
+            length = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+            if 10 <= length <= max_allowed:
+                lengths.append((length, x0, y0, x1, y1))
+
+        if not lengths:
+            continue
+
+        key = f"w={round(w,2)}"
+        if key not in categories:
+            categories[key] = {"w": w, "col": col, "segments": []}
+        categories[key]["segments"].extend(lengths)
+
+    # Garder uniquement les catégories avec assez de segments longs
+    wall_categories = {}
+    for key, data in categories.items():
+        segs = data["segments"]
+        nb_long = len([s for s in segs if s[0] > 20])
+        if nb_long >= 5:
+            wall_categories[key] = data
+
+    # Si plusieurs catégories, garder les plus épaisses
+    # (trier par épaisseur décroissante, garder max 3)
+    sorted_cats = sorted(wall_categories.items(), key=lambda x: -x[1]["w"])
+
+    return dict(sorted_cats[:3])
+
 @app.post("/explore-vectors")
 def explore_vectors(req: DetectRoomRequest):
     try:
@@ -67,11 +127,24 @@ def explore_vectors(req: DetectRoomRequest):
                 "top10": ls[:10],
             }
 
+        # Détection adaptive des murs
+        wall_cats = detect_wall_categories(paths, page.rect.width, page.rect.height)
+        wall_summary = {}
+        for key, data in wall_cats.items():
+            segs = data["segments"]
+            wall_summary[key] = {
+                "w": data["w"],
+                "nb_segments": len(segs),
+                "nb_gt20": len([s for s in segs if s[0] > 20]),
+                "longueur_max": round(max(s[0] for s in segs), 1),
+            }
+
         return {
             "nb_paths_total": len(paths),
             "page": {"width": page.rect.width, "height": page.rect.height},
             "widths_distribution": dict(widths.most_common(20)),
             "segments_par_categorie": summary,
+            "murs_detectes_auto": wall_summary,
         }
 
     except Exception as e:
@@ -86,9 +159,6 @@ def debug_vectors(req: DetectRoomRequest):
         pdf = fitz.open(stream=response.content, filetype="pdf")
         page = pdf[req.page_number - 1]
 
-        min_width = 0.28
-        min_length = 30
-
         zoom = 1
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
@@ -98,40 +168,26 @@ def debug_vectors(req: DetectRoomRequest):
         wall_img = np.ones((pix.height, pix.width, 3), dtype=np.uint8) * 255
 
         paths = page.get_drawings()
+        wall_cats = detect_wall_categories(paths, page.rect.width, page.rect.height)
+
+        # Couleurs pour visualisation selon rang d'épaisseur
+        colors_vis = [(0, 0, 200), (0, 150, 255), (0, 200, 0)]
         n_drawn = 0
+        cats_info = {}
 
-        for p in paths:
-            w = p.get('width') or 0
-            col = p.get('color')
-            if w < min_width:
-                continue
-            if col is None:
-                continue
+        for i, (key, data) in enumerate(wall_cats.items()):
+            color = colors_vis[i % len(colors_vis)]
+            thickness = max(2, int(data["w"] * 4))
+            count = 0
 
-            for item in p.get('items', []):
-                if item[0] != 'l':
-                    continue
-                x0, y0 = item[1].x, item[1].y
-                x1, y1 = item[2].x, item[2].y
-                length = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
-                if length < min_length:
-                    continue
-
+            for length, x0, y0, x1, y1 in data["segments"]:
                 pt1 = (int(x0 * zoom), int(y0 * zoom))
                 pt2 = (int(x1 * zoom), int(y1 * zoom))
-
-                if w >= 0.85:
-                    color = (0, 0, 200)
-                    thickness = 6
-                elif w >= 0.43:
-                    color = (0, 150, 255)
-                    thickness = 4
-                else:
-                    color = (0, 200, 0)
-                    thickness = 2
-
                 cv2.line(wall_img, pt1, pt2, color, thickness)
+                count += 1
                 n_drawn += 1
+
+            cats_info[key] = {"w": data["w"], "segments_dessines": count, "couleur": color}
 
         cv2.imwrite("/tmp/debug_vectors.png", wall_img)
 
@@ -140,7 +196,11 @@ def debug_vectors(req: DetectRoomRequest):
         overlay[mask] = wall_img[mask]
         cv2.imwrite("/tmp/debug_vectors_overlay.png", overlay)
 
-        return {"segments_dessines": n_drawn, "zoom": zoom}
+        return {
+            "segments_dessines": n_drawn,
+            "categories_murs": cats_info,
+            "zoom": zoom
+        }
 
     except Exception as e:
         import traceback
