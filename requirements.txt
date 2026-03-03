@@ -3,3 +3,5 @@ uvicorn
 opencv-python-headless
 numpy
 python-multipart
+pymupdf
+requests
