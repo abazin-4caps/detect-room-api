@@ -7,6 +7,7 @@ import cv2
 import os
 import requests
 import fitz
+from collections import Counter
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -29,6 +30,55 @@ def get_debug_image(filename: str):
         return FileResponse(path)
     raise HTTPException(status_code=404, detail="Fichier non trouvé")
 
+@app.post("/explore-vectors")
+def explore_vectors(req: DetectRoomRequest):
+    try:
+        response = requests.get(req.pdf_url, timeout=30)
+        pdf = fitz.open(stream=response.content, filetype="pdf")
+        page = pdf[req.page_number - 1]
+        paths = page.get_drawings()
+
+        widths = Counter()
+        segments = {}
+
+        for p in paths:
+            w = round(p.get('width') or 0, 2)
+            widths[w] += 1
+            col = str(p.get('color'))
+            fill = str(p.get('fill'))
+            for item in p.get('items', []):
+                if item[0] == 'l':
+                    x0, y0 = item[1].x, item[1].y
+                    x1, y1 = item[2].x, item[2].y
+                    length = round(((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5, 1)
+                    key = f"w={w}|col={col}|fill={fill}"
+                    segments.setdefault(key, []).append(length)
+
+        summary = {}
+        for key, lengths in segments.items():
+            ls = sorted(lengths, reverse=True)
+            summary[key] = {
+                "nb_segments": len(ls),
+                "longueur_max": ls[0],
+                "longueur_moy": round(sum(ls) / len(ls), 1),
+                "nb_gt100": len([l for l in ls if l > 100]),
+                "nb_gt50":  len([l for l in ls if l > 50]),
+                "nb_gt20":  len([l for l in ls if l > 20]),
+                "top10": ls[:10],
+            }
+
+        return {
+            "nb_paths_total": len(paths),
+            "page": {"width": page.rect.width, "height": page.rect.height},
+            "widths_distribution": dict(widths.most_common(20)),
+            "segments_par_categorie": summary,
+        }
+
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/detect-room")
 def detect_room(req: DetectRoomRequest):
     try:
@@ -44,7 +94,6 @@ def detect_room(req: DetectRoomRequest):
         )
         crop_x, crop_y = clip.x0, clip.y0
 
-        # --- RENDU HAUTE RÉSOLUTION (zoom 4x) ---
         zoom = 4
         mat = fitz.Matrix(zoom, zoom).pretranslate(-clip.x0, -clip.y0)
         pix = page.get_pixmap(matrix=mat, clip=clip, colorspace=fitz.csRGB)
@@ -54,12 +103,8 @@ def detect_room(req: DetectRoomRequest):
 
         cv2.imwrite("/tmp/debug_render.png", img_bgr)
 
-        # --- CONVERSION NIVEAUX DE GRIS ---
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-        # --- SEUILLAGE ADAPTATIF pour capturer murs quelle que soit leur couleur ---
-        # blockSize=31 : zone locale assez large pour les plans
-        # C=10 : soustraire 10 à la moyenne locale (murs = zones sombres)
         adaptive = cv2.adaptiveThreshold(
             gray, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -69,29 +114,22 @@ def detect_room(req: DetectRoomRequest):
         )
         cv2.imwrite("/tmp/debug_adaptive.png", adaptive)
 
-        # --- NETTOYAGE : supprimer petits artefacts (hachures, texte, meubles) ---
-        # Erosion pour éliminer les traits fins
         kernel_thin = np.ones((2, 2), np.uint8)
         cleaned = cv2.erode(adaptive, kernel_thin, iterations=1)
 
-        # Dilatation pour reconnecter les murs épais qui auraient été fragmentés
         kernel_thick = np.ones((4, 4), np.uint8)
         cleaned = cv2.dilate(cleaned, kernel_thick, iterations=1)
 
         cv2.imwrite("/tmp/debug_cleaned.png", cleaned)
 
-        # --- FERMETURE MORPHOLOGIQUE pour boucher les gaps dans les murs ---
-        # Kernel 25x25 : assez grand pour fermer les ouvertures de portes (~80-100px à zoom 4)
         kernel_close = np.ones((25, 25), np.uint8)
         closed = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel_close)
         cv2.imwrite("/tmp/debug_closed.png", closed)
 
-        # --- FLOOD FILL depuis le point de clic ---
         flood = cv2.bitwise_not(closed)
         click_px = int((req.click_x - crop_x) * zoom)
         click_py = int((req.click_y - crop_y) * zoom)
 
-        # Clamp pour éviter les débordements hors image
         click_px = max(1, min(click_px, img_w - 2))
         click_py = max(1, min(click_py, img_h - 2))
 
@@ -107,7 +145,6 @@ def detect_room(req: DetectRoomRequest):
         if cv2.countNonZero(room_mask) < 500:
             raise HTTPException(status_code=404, detail="Aucune pièce détectée au point de clic")
 
-        # --- EXTRACTION DU CONTOUR ---
         kernel_erode = np.ones((8, 8), np.uint8)
         room_eroded = cv2.erode(room_mask, kernel_erode, iterations=1)
         contours, _ = cv2.findContours(room_eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -124,7 +161,6 @@ def detect_room(req: DetectRoomRequest):
             for p in polygon
         ]
 
-        # --- DEBUG : visualisation du polygone sur le rendu ---
         debug_poly = img_bgr.copy()
         pts = np.array([[int(p[0][0]), int(p[0][1])] for p in polygon], dtype=np.int32)
         cv2.polylines(debug_poly, [pts], True, (0, 255, 0), 3)
@@ -137,5 +173,5 @@ def detect_room(req: DetectRoomRequest):
         raise
     except Exception as e:
         import traceback
-        print(traceback.format_exc())  # ← ajoute cette ligne
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
