@@ -79,7 +79,7 @@ def detect_room(req: DetectRoomRequest):
             widths_sorted = sorted(set(widths))
             print(f"ÉPAISSEURS: {widths_sorted[:20]}")
             # Prendre les traits dont l'épaisseur est dans le top 30%
-            threshold_width = np.percentile(widths, 70)
+            threshold_width = np.percentile(widths, 90)
             print(f"SEUIL ÉPAISSEUR: {threshold_width}")
         else:
             threshold_width = 0.5
