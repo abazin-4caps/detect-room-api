@@ -52,8 +52,8 @@ def detect_room(req: DetectRoomRequest):
 
         # Supprimer les traits fins (meubles, cotations, texte)
         # Ne garde que les murs épais
-        kernel_thin = np.ones((3, 3), np.uint8)
-        walls_only = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_thin, iterations=2)
+        kernel_thin = np.ones((2, 2), np.uint8)
+        walls_only = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_thin, iterations=1)
 
         # Fermer les portes
         kernel_close = np.ones((20, 20), np.uint8)
