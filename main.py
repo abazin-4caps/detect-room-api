@@ -22,7 +22,7 @@ class DetectRoomRequest(BaseModel):
     click_x: float
     click_y: float
     page_number: int = 1
-    crop_radius: float = 300  # rayon en points PDF autour du clic
+    crop_radius: float = 300
 
 @app.get("/")
 def health():
@@ -45,13 +45,11 @@ def detect_room(req: DetectRoomRequest):
         if response.status_code != 200:
             raise HTTPException(status_code=400, detail="Impossible de télécharger le PDF")
 
-        # Ouvrir avec PyMuPDF
         pdf = fitz.open(stream=response.content, filetype="pdf")
         page = pdf[req.page_number - 1]
         page_rect = page.rect
-        print(f"PAGE SIZE: {page_rect.width}x{page_rect.height} points")
 
-        # Définir le crop autour du clic
+        # Zone de crop autour du clic
         r = req.crop_radius
         clip = fitz.Rect(
             max(0, req.click_x - r),
@@ -59,53 +57,93 @@ def detect_room(req: DetectRoomRequest):
             min(page_rect.width, req.click_x + r),
             min(page_rect.height, req.click_y + r),
         )
-
         crop_x = clip.x0
         crop_y = clip.y0
 
-        # Rendu uniquement du crop à zoom 2x
-        zoom = 2
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
+        zoom = 3
+        img_w = int(clip.width * zoom)
+        img_h = int(clip.height * zoom)
 
-        print(f"CROP IMAGE: {pix.width}x{pix.height}px")
+        print(f"CROP: {img_w}x{img_h}px")
 
-        # Convertir en OpenCV
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        # Créer une image noire
+        walls_img = np.zeros((img_h, img_w), dtype=np.uint8)
 
-        h, w = img.shape[:2]
+        # Extraire les paths vectoriels de la page
+        paths = page.get_drawings()
+        print(f"PATHS TROUVÉS: {len(paths)}")
 
-        # Coordonnées du clic dans le crop
-        click_px = int((req.click_x - crop_x) * zoom)
-        click_py = int((req.click_y - crop_y) * zoom)
+        # Analyser les épaisseurs pour trouver le seuil des murs
+        widths = [p.get("width", 0) for p in paths if p.get("width", 0) > 0]
+        if widths:
+            widths_sorted = sorted(set(widths))
+            print(f"ÉPAISSEURS: {widths_sorted[:20]}")
+            # Prendre les traits dont l'épaisseur est dans le top 30%
+            threshold_width = np.percentile(widths, 70)
+            print(f"SEUIL ÉPAISSEUR: {threshold_width}")
+        else:
+            threshold_width = 0.5
 
-        print(f"CLICK IN CROP: {click_px},{click_py}")
+        # Dessiner uniquement les murs (traits épais) sur l'image
+        wall_count = 0
+        for path in paths:
+            width = path.get("width", 0)
+            if width < threshold_width:
+                continue
 
-        if not (0 <= click_px < w and 0 <= click_py < h):
-            raise HTTPException(status_code=400, detail="Coordonnées hors crop")
+            # Vérifier que le path est dans la zone de crop
+            rect = path.get("rect")
+            if rect is None:
+                continue
+            if not clip.intersects(rect):
+                continue
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            # Dessiner les segments du path
+            for item in path.get("items", []):
+                if item[0] == "l":  # ligne
+                    p1, p2 = item[1], item[2]
+                    x1 = int((p1.x - crop_x) * zoom)
+                    y1 = int((p1.y - crop_y) * zoom)
+                    x2 = int((p2.x - crop_x) * zoom)
+                    y2 = int((p2.y - crop_y) * zoom)
+                    thickness = max(3, int(width * zoom))
+                    cv2.line(walls_img, (x1, y1), (x2, y2), 255, thickness)
+                    wall_count += 1
+                elif item[0] == "re":  # rectangle
+                    rect2 = item[1]
+                    x1 = int((rect2.x0 - crop_x) * zoom)
+                    y1 = int((rect2.y0 - crop_y) * zoom)
+                    x2 = int((rect2.x1 - crop_x) * zoom)
+                    y2 = int((rect2.y1 - crop_y) * zoom)
+                    thickness = max(3, int(width * zoom))
+                    cv2.rectangle(walls_img, (x1, y1), (x2, y2), 255, thickness)
+                    wall_count += 1
+                elif item[0] == "c":  # courbe de bezier
+                    p1, p2, p3, p4 = item[1], item[2], item[3], item[4]
+                    x1 = int((p1.x - crop_x) * zoom)
+                    y1 = int((p1.y - crop_y) * zoom)
+                    x2 = int((p4.x - crop_x) * zoom)
+                    y2 = int((p4.y - crop_y) * zoom)
+                    thickness = max(3, int(width * zoom))
+                    cv2.line(walls_img, (x1, y1), (x2, y2), 255, thickness)
+                    wall_count += 1
 
-        # Seuillage
-        _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
-
-        # Supprimer traits fins
-        kernel_open = np.ones((2, 2), np.uint8)
-        walls_only = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_open, iterations=1)
+        print(f"SEGMENTS DESSINÉS: {wall_count}")
 
         # Fermer les portes
-        kernel_close = np.ones((15, 15), np.uint8)
-        closed = cv2.morphologyEx(walls_only, cv2.MORPH_CLOSE, kernel_close)
+        kernel_close = np.ones((20, 20), np.uint8)
+        closed = cv2.morphologyEx(walls_img, cv2.MORPH_CLOSE, kernel_close)
 
         # Debug
-        cv2.imwrite("/tmp/debug_crop.png", img)
-        cv2.imwrite("/tmp/debug_walls.png", walls_only)
+        cv2.imwrite("/tmp/debug_walls.png", walls_img)
         cv2.imwrite("/tmp/debug_closed.png", closed)
 
         # Flood fill
         flood = cv2.bitwise_not(closed)
-        mask = np.zeros((h + 2, w + 2), np.uint8)
+        click_px = int((req.click_x - crop_x) * zoom)
+        click_py = int((req.click_y - crop_y) * zoom)
+
+        mask = np.zeros((img_h + 2, img_w + 2), np.uint8)
         cv2.floodFill(flood, mask, (click_px, click_py), 128)
         room_mask = np.uint8(flood == 128) * 255
 
@@ -127,7 +165,7 @@ def detect_room(req: DetectRoomRequest):
         epsilon = 0.02 * cv2.arcLength(contour, True)
         polygon = cv2.approxPolyDP(contour, epsilon, True)
 
-        # Reconvertir en coordonnées PDF natives
+        # Reconvertir en coordonnées PDF
         points = [
             [round(p[0][0] / zoom + crop_x, 2), round(p[0][1] / zoom + crop_y, 2)]
             for p in polygon
