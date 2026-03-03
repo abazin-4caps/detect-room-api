@@ -136,4 +136,6 @@ def detect_room(req: DetectRoomRequest):
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        print(traceback.format_exc())  # ← ajoute cette ligne
         raise HTTPException(status_code=500, detail=str(e))
