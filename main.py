@@ -86,7 +86,7 @@ def debug_vectors(req: DetectRoomRequest):
         pdf = fitz.open(stream=response.content, filetype="pdf")
         page = pdf[req.page_number - 1]
 
-        min_width = 0.43
+        min_width = 0.28
         min_length = 30
 
         zoom = 1
