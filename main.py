@@ -6,16 +6,10 @@ import numpy as np
 import cv2
 import os
 import requests
-import fitz  # PyMuPDF
+import fitz
 
 app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 class DetectRoomRequest(BaseModel):
     pdf_url: str
@@ -38,144 +32,108 @@ def get_debug_image(filename: str):
 @app.post("/detect-room")
 def detect_room(req: DetectRoomRequest):
     try:
-        print(f"CLICK: x={req.click_x}, y={req.click_y}, page={req.page_number}")
-
-        # Télécharger le PDF
         response = requests.get(req.pdf_url, timeout=30)
-        if response.status_code != 200:
-            raise HTTPException(status_code=400, detail="Impossible de télécharger le PDF")
-
         pdf = fitz.open(stream=response.content, filetype="pdf")
         page = pdf[req.page_number - 1]
         page_rect = page.rect
 
-        # Zone de crop autour du clic
         r = req.crop_radius
         clip = fitz.Rect(
-            max(0, req.click_x - r),
-            max(0, req.click_y - r),
-            min(page_rect.width, req.click_x + r),
-            min(page_rect.height, req.click_y + r),
+            max(0, req.click_x - r), max(0, req.click_y - r),
+            min(page_rect.width, req.click_x + r), min(page_rect.height, req.click_y + r),
         )
-        crop_x = clip.x0
-        crop_y = clip.y0
+        crop_x, crop_y = clip.x0, clip.y0
 
-        zoom = 3
-        img_w = int(clip.width * zoom)
-        img_h = int(clip.height * zoom)
+        # --- RENDU HAUTE RÉSOLUTION (zoom 4x) ---
+        zoom = 4
+        mat = fitz.Matrix(zoom, zoom).pretranslate(-clip.x0, -clip.y0)
+        pix = page.get_pixmap(matrix=mat, clip=clip, colorspace=fitz.csRGB)
+        img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+        img_h, img_w = img_bgr.shape[:2]
 
-        print(f"CROP: {img_w}x{img_h}px")
+        cv2.imwrite("/tmp/debug_render.png", img_bgr)
 
-        # Créer une image noire
-        walls_img = np.zeros((img_h, img_w), dtype=np.uint8)
+        # --- CONVERSION NIVEAUX DE GRIS ---
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-        # Extraire les paths vectoriels de la page
-        paths = page.get_drawings()
-        print(f"PATHS TROUVÉS: {len(paths)}")
+        # --- SEUILLAGE ADAPTATIF pour capturer murs quelle que soit leur couleur ---
+        # blockSize=31 : zone locale assez large pour les plans
+        # C=10 : soustraire 10 à la moyenne locale (murs = zones sombres)
+        adaptive = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            blockSize=31,
+            C=10
+        )
+        cv2.imwrite("/tmp/debug_adaptive.png", adaptive)
 
-        # Analyser les épaisseurs pour trouver le seuil des murs
-        widths = [p.get("width") or 0 for p in paths if (p.get("width") or 0) > 0]
-        if widths:
-            widths_sorted = sorted(set(widths))
-            print(f"ÉPAISSEURS: {widths_sorted[:20]}")
-            # Prendre les traits dont l'épaisseur est dans le top 30%
-            threshold_width = np.percentile(widths, 90)
-            print(f"SEUIL ÉPAISSEUR: {threshold_width}")
-        else:
-            threshold_width = 0.5
+        # --- NETTOYAGE : supprimer petits artefacts (hachures, texte, meubles) ---
+        # Erosion pour éliminer les traits fins
+        kernel_thin = np.ones((2, 2), np.uint8)
+        cleaned = cv2.erode(adaptive, kernel_thin, iterations=1)
 
-        # Dessiner uniquement les murs (traits épais) sur l'image
-        wall_count = 0
-        for path in paths:
-            width = path.get("width") or 0
-            if width < threshold_width:
-                continue
+        # Dilatation pour reconnecter les murs épais qui auraient été fragmentés
+        kernel_thick = np.ones((4, 4), np.uint8)
+        cleaned = cv2.dilate(cleaned, kernel_thick, iterations=1)
 
-            # Vérifier que le path est dans la zone de crop
-            rect = path.get("rect")
-            if rect is None:
-                continue
-            if not clip.intersects(rect):
-                continue
+        cv2.imwrite("/tmp/debug_cleaned.png", cleaned)
 
-            # Dessiner les segments du path
-            for item in path.get("items", []):
-                if item[0] == "l":  # ligne
-                    p1, p2 = item[1], item[2]
-                    x1 = int((p1.x - crop_x) * zoom)
-                    y1 = int((p1.y - crop_y) * zoom)
-                    x2 = int((p2.x - crop_x) * zoom)
-                    y2 = int((p2.y - crop_y) * zoom)
-                    thickness = max(3, int(width * zoom))
-                    cv2.line(walls_img, (x1, y1), (x2, y2), 255, thickness)
-                    wall_count += 1
-                elif item[0] == "re":  # rectangle
-                    rect2 = item[1]
-                    x1 = int((rect2.x0 - crop_x) * zoom)
-                    y1 = int((rect2.y0 - crop_y) * zoom)
-                    x2 = int((rect2.x1 - crop_x) * zoom)
-                    y2 = int((rect2.y1 - crop_y) * zoom)
-                    thickness = max(3, int(width * zoom))
-                    cv2.rectangle(walls_img, (x1, y1), (x2, y2), 255, thickness)
-                    wall_count += 1
-                elif item[0] == "c":  # courbe de bezier
-                    p1, p2, p3, p4 = item[1], item[2], item[3], item[4]
-                    x1 = int((p1.x - crop_x) * zoom)
-                    y1 = int((p1.y - crop_y) * zoom)
-                    x2 = int((p4.x - crop_x) * zoom)
-                    y2 = int((p4.y - crop_y) * zoom)
-                    thickness = max(3, int(width * zoom))
-                    cv2.line(walls_img, (x1, y1), (x2, y2), 255, thickness)
-                    wall_count += 1
-
-        print(f"SEGMENTS DESSINÉS: {wall_count}")
-
-        # Fermer les portes
-        kernel_close = np.ones((20, 20), np.uint8)
-        closed = cv2.morphologyEx(walls_img, cv2.MORPH_CLOSE, kernel_close)
-
-        # Debug
-        cv2.imwrite("/tmp/debug_walls.png", walls_img)
+        # --- FERMETURE MORPHOLOGIQUE pour boucher les gaps dans les murs ---
+        # Kernel 25x25 : assez grand pour fermer les ouvertures de portes (~80-100px à zoom 4)
+        kernel_close = np.ones((25, 25), np.uint8)
+        closed = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel_close)
         cv2.imwrite("/tmp/debug_closed.png", closed)
 
-        # Flood fill
+        # --- FLOOD FILL depuis le point de clic ---
         flood = cv2.bitwise_not(closed)
         click_px = int((req.click_x - crop_x) * zoom)
         click_py = int((req.click_y - crop_y) * zoom)
 
-        mask = np.zeros((img_h + 2, img_w + 2), np.uint8)
-        cv2.floodFill(flood, mask, (click_px, click_py), 128)
-        room_mask = np.uint8(flood == 128) * 255
+        # Clamp pour éviter les débordements hors image
+        click_px = max(1, min(click_px, img_w - 2))
+        click_py = max(1, min(click_py, img_h - 2))
 
+        mask = np.zeros((img_h + 2, img_w + 2), np.uint8)
+        flags = 4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
+        cv2.floodFill(flood, mask, (click_px, click_py), 128,
+                      loDiff=10, upDiff=10, flags=flags)
+
+        room_mask = mask[1:-1, 1:-1]
+        room_mask = np.uint8(room_mask == 255) * 255
         cv2.imwrite("/tmp/debug_flood.png", room_mask)
 
         if cv2.countNonZero(room_mask) < 500:
-            raise HTTPException(status_code=404, detail="Aucune pièce détectée")
+            raise HTTPException(status_code=404, detail="Aucune pièce détectée au point de clic")
 
-        # Simplification contour
-        kernel_erode = np.ones((6, 6), np.uint8)
+        # --- EXTRACTION DU CONTOUR ---
+        kernel_erode = np.ones((8, 8), np.uint8)
         room_eroded = cv2.erode(room_mask, kernel_erode, iterations=1)
-
         contours, _ = cv2.findContours(room_eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not contours:
-            raise HTTPException(status_code=404, detail="Aucun contour trouvé")
+            raise HTTPException(status_code=404, detail="Contour introuvable après érosion")
 
         contour = max(contours, key=cv2.contourArea)
-        epsilon = 0.02 * cv2.arcLength(contour, True)
+        epsilon = 0.015 * cv2.arcLength(contour, True)
         polygon = cv2.approxPolyDP(contour, epsilon, True)
 
-        # Reconvertir en coordonnées PDF
         points = [
             [round(p[0][0] / zoom + crop_x, 2), round(p[0][1] / zoom + crop_y, 2)]
             for p in polygon
         ]
 
-        print(f"POINTS: {len(points)}")
+        # --- DEBUG : visualisation du polygone sur le rendu ---
+        debug_poly = img_bgr.copy()
+        pts = np.array([[int(p[0][0]), int(p[0][1])] for p in polygon], dtype=np.int32)
+        cv2.polylines(debug_poly, [pts], True, (0, 255, 0), 3)
+        cv2.circle(debug_poly, (click_px, click_py), 10, (0, 0, 255), -1)
+        cv2.imwrite("/tmp/debug_polygon.png", debug_poly)
+
         return {"polygon": points, "point_count": len(points)}
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"ERREUR: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
