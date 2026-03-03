@@ -26,7 +26,6 @@ def health():
 @app.post("/detect-room")
 def detect_room(req: DetectRoomRequest):
     try:
-        # Décoder l'image
         img_bytes = base64.b64decode(req.image_base64)
         np_arr = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -36,40 +35,57 @@ def detect_room(req: DetectRoomRequest):
 
         h, w = img.shape[:2]
 
-        # Vérifier que le clic est dans l'image
         if not (0 <= req.click_x < w and 0 <= req.click_y < h):
             raise HTTPException(status_code=400, detail="Coordonnées hors image")
 
-        # Binarisation : murs en noir, espace en blanc
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
 
-        # Fermer les gaps (portes, ouvertures)
-        kernel = np.ones((7, 7), np.uint8)
-        closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        # Seuillage adaptatif — meilleur sur plans architecte
+        binary = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=15, C=4
+        )
 
-        # Flood fill depuis le point cliqué
+        # Fermer les portes avec un kernel plus grand
+        kernel_close = np.ones((15, 15), np.uint8)
+        closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_close)
+
+        # Dilater les murs pour bien fermer les gaps
+        kernel_dilate = np.ones((3, 3), np.uint8)
+        closed = cv2.dilate(closed, kernel_dilate, iterations=2)
+
+        # Flood fill
         flood = closed.copy()
         mask = np.zeros((h + 2, w + 2), np.uint8)
         cv2.floodFill(flood, mask, (req.click_x, req.click_y), 128)
 
-        # Isoler la zone remplie
         room_mask = np.uint8(flood == 128) * 255
 
-        # Extraire le contour
+        # Filtrer les petites zones parasites
         contours, _ = cv2.findContours(room_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         if not contours:
             raise HTTPException(status_code=404, detail="Aucune pièce détectée")
 
-        # Prendre le plus grand contour
-        contour = max(contours, key=cv2.contourArea)
+        # Prendre le contour le plus proche du point cliqué
+        def dist_to_click(c):
+            M = cv2.moments(c)
+            if M["m00"] == 0:
+                return float('inf')
+            cx = M["m10"] / M["m00"]
+            cy = M["m01"] / M["m00"]
+            return (cx - req.click_x)**2 + (cy - req.click_y)**2
 
-        # Simplifier en polygone
-        epsilon = 0.005 * cv2.arcLength(contour, True)
+        contour = min(contours, key=dist_to_click)
+
+        # Surface minimale pour éviter le bruit
+        if cv2.contourArea(contour) < 500:
+            raise HTTPException(status_code=404, detail="Zone trop petite")
+
+        epsilon = 0.008 * cv2.arcLength(contour, True)
         polygon = cv2.approxPolyDP(contour, epsilon, True)
-
-        # Convertir en liste de points
         points = [[int(p[0][0]), int(p[0][1])] for p in polygon]
 
         return {"polygon": points, "point_count": len(points)}
