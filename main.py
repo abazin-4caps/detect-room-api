@@ -29,6 +29,9 @@ def detect_room(req: DetectRoomRequest):
         img_bytes = base64.b64decode(req.image_base64)
         np_arr = np.frombuffer(img_bytes, np.uint8)
         img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        print(f"IMAGE REÇUE: {len(img_bytes)} bytes")
+        print(f"IMAGE SHAPE: {img.shape if img is not None else 'None'}")
+        print(f"CLICK: x={req.click_x}, y={req.click_y}")
 
         if img is None:
             raise HTTPException(status_code=400, detail="Image invalide")
