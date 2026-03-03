@@ -86,7 +86,7 @@ def detect_wall_categories(paths, page_width, page_height):
 
     # Si plusieurs catégories, garder les plus épaisses
     # (trier par épaisseur décroissante, garder max 3)
-    sorted_cats = sorted(wall_categories.items(), key=lambda x: -x[1]["w"])
+    sorted_cats = sorted(wall_categories.items(), key=lambda x: -len([s for s in x[1]["segments"] if s[0] > 20]))
 
     return dict(sorted_cats[:3])
 
