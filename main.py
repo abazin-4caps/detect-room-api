@@ -74,7 +74,7 @@ def detect_room(req: DetectRoomRequest):
         print(f"PATHS TROUVÉS: {len(paths)}")
 
         # Analyser les épaisseurs pour trouver le seuil des murs
-        widths = [p.get("width", 0) for p in paths if p.get("width", 0) > 0]
+        widths = [p.get("width") or 0 for p in paths if (p.get("width") or 0) > 0]
         if widths:
             widths_sorted = sorted(set(widths))
             print(f"ÉPAISSEURS: {widths_sorted[:20]}")
@@ -87,7 +87,7 @@ def detect_room(req: DetectRoomRequest):
         # Dessiner uniquement les murs (traits épais) sur l'image
         wall_count = 0
         for path in paths:
-            width = path.get("width", 0)
+            width = path.get("width") or 0
             if width < threshold_width:
                 continue
 
