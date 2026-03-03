@@ -85,4 +85,59 @@ def detect_room(req: DetectRoomRequest):
         if not (0 <= click_px < w and 0 <= click_py < h):
             raise HTTPException(status_code=400, detail="Coordonnées hors crop")
 
-        gray = cv2.cvtColo
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Seuillage
+        _, binary = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
+
+        # Supprimer traits fins
+        kernel_open = np.ones((2, 2), np.uint8)
+        walls_only = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_open, iterations=1)
+
+        # Fermer les portes
+        kernel_close = np.ones((15, 15), np.uint8)
+        closed = cv2.morphologyEx(walls_only, cv2.MORPH_CLOSE, kernel_close)
+
+        # Debug
+        cv2.imwrite("/tmp/debug_crop.png", img)
+        cv2.imwrite("/tmp/debug_walls.png", walls_only)
+        cv2.imwrite("/tmp/debug_closed.png", closed)
+
+        # Flood fill
+        flood = cv2.bitwise_not(closed)
+        mask = np.zeros((h + 2, w + 2), np.uint8)
+        cv2.floodFill(flood, mask, (click_px, click_py), 128)
+        room_mask = np.uint8(flood == 128) * 255
+
+        cv2.imwrite("/tmp/debug_flood.png", room_mask)
+
+        if cv2.countNonZero(room_mask) < 500:
+            raise HTTPException(status_code=404, detail="Aucune pièce détectée")
+
+        # Simplification contour
+        kernel_erode = np.ones((6, 6), np.uint8)
+        room_eroded = cv2.erode(room_mask, kernel_erode, iterations=1)
+
+        contours, _ = cv2.findContours(room_eroded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours:
+            raise HTTPException(status_code=404, detail="Aucun contour trouvé")
+
+        contour = max(contours, key=cv2.contourArea)
+        epsilon = 0.02 * cv2.arcLength(contour, True)
+        polygon = cv2.approxPolyDP(contour, epsilon, True)
+
+        # Reconvertir en coordonnées PDF natives
+        points = [
+            [round(p[0][0] / zoom + crop_x, 2), round(p[0][1] / zoom + crop_y, 2)]
+            for p in polygon
+        ]
+
+        print(f"POINTS: {len(points)}")
+        return {"polygon": points, "point_count": len(points)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ERREUR: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
